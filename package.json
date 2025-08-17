@@ -8,11 +8,16 @@
         "testnode": "hardhat node",
         "deploy:local": "hardhat run scripts/01-openRound.ts --network hardhat",
         "openRound:somnia": "hardhat run scripts/01-openRound.ts --network somnia",
+        "openRound:somnia:deploy": "FORCE_DEPLOY=1 hardhat run scripts/01-openRound.ts --network somnia",
+        "openRound:local": "hardhat run scripts/01-openRound.ts --network hardhat",
         "commit": "hardhat run scripts/02-commitBuy.ts --network somnia",
         "reveal": "hardhat run scripts/03-reveal.ts --network somnia",
         "draw": "hardhat run scripts/04-requestDraw.ts --network somnia",
         "winning": "hardhat run scripts/05-getWinning.ts --network somnia",
-        "claim": "hardhat run scripts/06-claim.ts --network somnia"
+        "claim": "hardhat run scripts/06-claim.ts --network somnia",
+        "status": "hardhat run scripts/00-status.ts --network somnia",
+        "set:price": "hardhat run scripts/07-setTicketPrice.ts --network somnia",
+        "vrf:fee": "hardhat run scripts/08-getVrfFee.ts --network somnia"
     },
     "devDependencies": {
         "@nomicfoundation/hardhat-toolbox": "^5.0.0",
