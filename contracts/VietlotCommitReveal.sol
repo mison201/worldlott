@@ -4,7 +4,7 @@ pragma solidity ^0.8.20;
 import {VRFV2PlusWrapperConsumerBase} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFV2PlusWrapperConsumerBase.sol";
 import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
 
-// Simple ReentrancyGuard
+/// @dev Minimal ReentrancyGuard
 abstract contract ReentrancyGuard {
     uint256 private _status = 1;
     modifier nonReentrant() {
@@ -16,18 +16,19 @@ abstract contract ReentrancyGuard {
 }
 
 /**
- * VietlotCommitReveal
- * - Game kiểu 6/N (mặc định 6/55) với commit–reveal để chống front-running.
- * - Commit hash = keccak256(abi.encode(roundId, sortedNumbers[], salt, msg.sender))
- *   => ràng buộc vé với người chơi + vòng chơi; phải reveal trước khi draw.
+ * @title VietlotCommitReveal
+ * @notice Lottery kiểu 6/N với commit–reveal chống front-running, quay số bằng Chainlink VRF V2+ Wrapper.
+ *         ĐÃ tách prizePoolLocked & operatorFeeAccrued; rút fee chỉ sau finalizeRound().
+ *
+ * Commit: keccak256(abi.encode(roundId, sortedNumbers[], salt, msg.sender))
  */
 contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
     // ===== Game config =====
     uint8 public immutable k; // số lượng con số trên vé (vd 6)
     uint8 public n; // miền số tối đa (vd 55)
-    uint256 public ticketPrice; // giá vé (wei của native token)
+    uint256 public ticketPrice; // giá vé (wei)
     address public owner;
-    uint16 public feeBps; // phí vận hành theo bps
+    uint16 public feeBps; // phí vận hành theo bps (0..10000)
     uint16 public prizeBpsK; // chia thưởng trúng đủ k
     uint16 public prizeBpsK_1; // chia thưởng trúng k-1
     uint16 public prizeBpsK_2; // chia thưởng trúng k-2
@@ -42,26 +43,29 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
         uint256 id;
         uint64 salesStart;
         uint64 salesEnd;
-        uint64 revealEnd; // kết thúc reveal (must be < draw time)
+        uint64 revealEnd;
         bool drawRequested;
         bool drawn;
         uint256 requestId;
-        uint8[] winningNumbers; // sorted length == k
-        uint256 salesAmount; // tổng tiền bán vé
-        // ==== Commit–reveal data ====
-        // Commit của từng user => tổng số vé đã mua theo commit này (chỉ để kiểm soát tiền/limit)
-        mapping(bytes32 => uint256) userCommitQty;
-        // Số vé đã reveal cho một commit (để không cho reveal > commitQty)
-        mapping(bytes32 => uint256) userRevealQty;
-        // Tổng vé đã reveal theo combination (định danh bởi numbersHash = keccak(sortedNumbers))
-        mapping(bytes32 => uint256) revealedCountByCombo;
-        // Claim theo combination cho tất cả người chơi (đã reveal)
-        mapping(bytes32 => uint256) claimedCountByCombo;
-        // Đếm winner động khi claim (để chia pro-rata)
+        uint8[] winningNumbers;
+        // Doanh thu (tích luỹ khi commitBuy)
+        uint256 salesAmount;
+        // ===== Hạch toán tách bạch (khóa sau khi draw) =====
+        uint256 operatorFeeAccrued; // phí vận hành tính sau draw
+        uint256 prizePoolLocked; // pool thưởng cố định sau draw
+        bool feeWithdrawn; // đã rút phí vận hành chưa
+        bool finalized; // đã "chốt vòng" cho phép rút phí
+        // Commit–reveal
+        mapping(bytes32 => uint256) userCommitQty; // commitHash => qty committed
+        mapping(bytes32 => uint256) userRevealQty; // commitHash => qty revealed
+        mapping(bytes32 => uint256) revealedCountByCombo; // numbersHash => tổng qty đã reveal
+        mapping(bytes32 => uint256) claimedCountByCombo; // numbersHash => tổng qty đã claim
+        // Winners (đếm động khi claim)
         uint256 winnersK;
         uint256 winnersK_1;
         uint256 winnersK_2;
     }
+
     mapping(uint256 => Round) private _rounds;
     uint256 public currentRoundId;
 
@@ -70,6 +74,7 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
     uint16 public constant REQUEST_CONFIRMATIONS = 3;
     uint32 public constant NUM_WORDS = 2;
 
+    // ===== Events =====
     event RoundOpened(
         uint256 indexed id,
         uint64 salesStart,
@@ -99,6 +104,8 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
         uint256 qty,
         uint256 amount
     );
+    event Finalized(uint256 indexed id);
+    event OperatorFeeWithdrawn(uint256 indexed id, address to, uint256 amount);
 
     constructor(
         address vrfWrapper,
@@ -164,6 +171,15 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
         prizeBpsK_2 = _pK2;
     }
 
+    /// @notice Chốt vòng: cho phép rút phí vận hành (sau khi draw).
+    function finalizeRound(uint256 roundId) external onlyOwner {
+        Round storage R = _rounds[roundId];
+        require(R.drawn, "NOT_DRAWN");
+        require(!R.finalized, "ALREADY_FINAL");
+        R.finalized = true;
+        emit Finalized(roundId);
+    }
+
     // ===== Commit API (Sales window) =====
     /**
      * @param commitHash keccak256(abi.encode(roundId, sortedNumbers[0..k-1], salt, msg.sender))
@@ -187,12 +203,6 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
     }
 
     // ===== Reveal API (Reveal window) =====
-    /**
-     * @dev Phải gọi trước khi revealEnd. Hệ thống kiểm tra:
-     *  - numbers hợp lệ + sorted, không trùng
-     *  - commitHash khớp: keccak(roundId, numbersSorted, salt, msg.sender)
-     *  - revealQty + qty <= commitQty
-     */
     function reveal(
         uint256 roundId,
         uint8[] calldata numbers,
@@ -206,7 +216,8 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
         );
         require(qty > 0, "BAD_QTY");
 
-        bytes32 numbersHash = _validateAndHashNumbers(numbers); // keccak(sortedNumbers)
+        bytes32 numbersHash = _validateAndHashNumbers(numbers); // keccak(sorted numbers)
+        // reconstruct commitHash
         bytes32 commitHash = keccak256(
             abi.encode(roundId, _sortCopy(numbers), salt, msg.sender)
         );
@@ -265,14 +276,15 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
         R.winningNumbers = win;
         R.drawn = true;
 
+        // ===== Chốt hạch toán doanh thu sau draw =====
+        uint256 opFee = (R.salesAmount * feeBps) / 10000;
+        R.operatorFeeAccrued = opFee;
+        R.prizePoolLocked = R.salesAmount - opFee;
+
         emit Drawn(R.id, win);
     }
 
     // ===== Claim =====
-    /**
-     * @param numbers vé đã reveal (phải đúng combination)
-     * @param qty số vé muốn claim (≤ số vé đã reveal, chưa claim)
-     */
     function claim(
         uint256 roundId,
         uint8[] calldata numbers,
@@ -285,8 +297,6 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
         bytes32 numbersHash = _validateAndHashNumbers(numbers);
         uint256 totalRevealed = R.revealedCountByCombo[numbersHash];
         require(totalRevealed > 0, "NOT_REVEALED");
-
-        // còn lại chưa claim
         uint256 claimed = R.claimedCountByCombo[numbersHash];
         require(claimed + qty <= totalRevealed, "OVER_CLAIM");
 
@@ -301,10 +311,10 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
                     : 0;
         require(prizeShareBps > 0, "NO_PRIZE");
 
-        uint256 operatorFee = (R.salesAmount * feeBps) / 10000;
-        uint256 prizePool = R.salesAmount - operatorFee;
+        // pool thưởng đã khóa sau draw
+        uint256 prizePool = R.prizePoolLocked;
 
-        // tăng bộ đếm winners theo tier (động)
+        // winners count (động)
         if (matches == k) R.winnersK += qty;
         else if (matches == k - 1) R.winnersK_1 += qty;
         else if (matches == k - 2) R.winnersK_2 += qty;
@@ -315,8 +325,9 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
                 ? R.winnersK_1
                 : R.winnersK_2;
         uint256 tierPool = (prizePool * prizeShareBps) / 10000;
-        uint256 amountPerTicket = tierPool / winners;
+        uint256 amountPerTicket = (winners > 0) ? (tierPool / winners) : 0;
         uint256 payout = amountPerTicket * qty;
+        require(payout > 0, "ZERO_PAYOUT");
 
         R.claimedCountByCombo[numbersHash] = claimed + qty;
 
@@ -326,6 +337,25 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
         emit Claimed(roundId, msg.sender, numbersHash, matches, qty, payout);
     }
 
+    // ===== Operator fee withdraw (sau khi finalize) =====
+    function withdrawOperatorFee(
+        uint256 roundId,
+        address to
+    ) external onlyOwner nonReentrant {
+        Round storage R = _rounds[roundId];
+        require(R.drawn, "NOT_DRAWN");
+        require(R.finalized, "NOT_FINALIZED");
+        require(!R.feeWithdrawn, "FEE_PAID");
+
+        uint256 fee = R.operatorFeeAccrued;
+        R.feeWithdrawn = true;
+
+        (bool ok, ) = to.call{value: fee}("");
+        require(ok, "FEE_TRANSFER_FAIL");
+
+        emit OperatorFeeWithdrawn(roundId, to, fee);
+    }
+
     // ===== Views =====
     function getWinningNumbers(
         uint256 roundId
@@ -333,12 +363,69 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
         require(_rounds[roundId].drawn, "NOT_DRAWN");
         return _rounds[roundId].winningNumbers;
     }
+
     function getRequestPrice() public view returns (uint256) {
         return
             i_vrfV2PlusWrapper.calculateRequestPriceNative(
                 CALLBACK_GAS_LIMIT,
                 NUM_WORDS
             );
+    }
+
+    function getSalesAmount(uint256 roundId) external view returns (uint256) {
+        return _rounds[roundId].salesAmount;
+    }
+
+    /// @return pool prizePoolLocked; drawn round đã quay số chưa
+    function getPrizePool(
+        uint256 roundId
+    ) external view returns (uint256 pool, bool drawn) {
+        Round storage R = _rounds[roundId];
+        return (R.prizePoolLocked, R.drawn);
+    }
+
+    /// @return fee operatorFeeAccrued; drawable đã đủ điều kiện rút; paid đã rút chưa
+    function getOperatorFee(
+        uint256 roundId
+    ) external view returns (uint256 fee, bool drawable, bool paid) {
+        Round storage R = _rounds[roundId];
+        fee = R.operatorFeeAccrued;
+        drawable = (R.drawn && R.finalized && !R.feeWithdrawn);
+        paid = R.feeWithdrawn;
+    }
+
+    /// @notice Tổng quan 1 vòng để UI tiện hiển thị
+    function getRoundInfo(
+        uint256 roundId
+    )
+        external
+        view
+        returns (
+            uint64 salesStart,
+            uint64 salesEnd,
+            uint64 revealEnd,
+            bool drawRequested,
+            bool drawn,
+            bool finalized,
+            uint256 salesAmount,
+            uint256 prizePoolLocked,
+            uint256 operatorFeeAccrued,
+            bool feeWithdrawn,
+            uint8[] memory winningNumbers
+        )
+    {
+        Round storage R = _rounds[roundId];
+        salesStart = R.salesStart;
+        salesEnd = R.salesEnd;
+        revealEnd = R.revealEnd;
+        drawRequested = R.drawRequested;
+        drawn = R.drawn;
+        finalized = R.finalized;
+        salesAmount = R.salesAmount;
+        prizePoolLocked = R.prizePoolLocked;
+        operatorFeeAccrued = R.operatorFeeAccrued;
+        feeWithdrawn = R.feeWithdrawn;
+        winningNumbers = R.winningNumbers;
     }
 
     // ===== Internal helpers =====
@@ -351,7 +438,7 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
             require(tmp[i] >= 1 && tmp[i] <= n, "OUT_RANGE");
             if (i > 0) require(tmp[i] != tmp[i - 1], "DUP");
         }
-        return keccak256(abi.encode(tmp)); // numbersHash (không gắn user)
+        return keccak256(abi.encode(tmp)); // numbersHash
     }
 
     function _sortCopy(
@@ -419,21 +506,6 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
                 }
             }
         }
-    }
-
-    // (Tùy chọn) rút phí vận hành sau khi đã draw — demo đơn giản
-    function withdrawOperatorFee(
-        uint256 roundId,
-        address to
-    ) external onlyOwner nonReentrant {
-        Round storage R = _rounds[roundId];
-        require(R.drawn, "NOT_DRAWN");
-        uint256 fee = (R.salesAmount * feeBps) / 10000;
-        uint256 pool = R.salesAmount; // giữ để tránh double-withdraw (có thể tinh chỉnh)
-        R.salesAmount = 0;
-        (bool ok, ) = to.call{value: fee}("");
-        require(ok, "FEE_TRANSFER_FAIL");
-        // Lưu ý: để production nên hạch toán pool thưởng riêng thay vì zeroing salesAmount.
     }
 
     receive() external payable {}

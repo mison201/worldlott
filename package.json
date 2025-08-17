@@ -17,7 +17,9 @@
         "claim": "hardhat run scripts/06-claim.ts --network somnia",
         "status": "hardhat run scripts/00-status.ts --network somnia",
         "set:price": "hardhat run scripts/07-setTicketPrice.ts --network somnia",
-        "vrf:fee": "hardhat run scripts/08-getVrfFee.ts --network somnia"
+        "vrf:fee": "hardhat run scripts/08-getVrfFee.ts --network somnia",
+        "pools:show": "hardhat run scripts/10-showPools.ts --network somnia",
+        "round:finalize": "hardhat run scripts/11-finalizeAndWithdraw.ts --network somnia"
     },
     "devDependencies": {
         "@nomicfoundation/hardhat-toolbox": "^5.0.0",

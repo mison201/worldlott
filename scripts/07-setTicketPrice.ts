@@ -1,8 +1,8 @@
 import { ethers } from "hardhat"
 
 function getNewPriceWei(): bigint {
-  // Ưu tiên NEW_TICKET_PRICE_WEI; nếu không có sẽ dùng NEW_TICKET_PRICE (ETH/STT) để parse
-  const wei = process.env.NEW_TICKET_PRICE_WEI
+  // Ưu tiên TICKET_PRICE_WEI; nếu không có sẽ dùng NEW_TICKET_PRICE (ETH/STT) để parse
+  const wei = process.env.TICKET_PRICE_WEI
   if (wei && wei.trim().length > 0) return BigInt(wei)
   const eth = process.env.NEW_TICKET_PRICE || "1" // ví dụ 1 STT
   return ethers.parseEther(eth)
