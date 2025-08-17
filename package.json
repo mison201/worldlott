@@ -19,7 +19,10 @@
         "set:price": "hardhat run scripts/07-setTicketPrice.ts --network somnia",
         "vrf:fee": "hardhat run scripts/08-getVrfFee.ts --network somnia",
         "pools:show": "hardhat run scripts/10-showPools.ts --network somnia",
-        "round:finalize": "hardhat run scripts/11-finalizeAndWithdraw.ts --network somnia"
+        "round:finalize": "hardhat run scripts/11-finalizeAndWithdraw.ts --network somnia",
+        "demo": "hardhat run scripts/12-demoFlow.ts --network hardhat",
+        "demo:a": "TARGET_MATCHES=4 FORCE_WIN_FOR=A hardhat run scripts/12-demoFlow.ts --network hardhat",
+        "demo:b": "TARGET_MATCHES=5 FORCE_WIN_FOR=B hardhat run scripts/12-demoFlow.ts --network hardhat"
     },
     "devDependencies": {
         "@nomicfoundation/hardhat-toolbox": "^5.0.0",
