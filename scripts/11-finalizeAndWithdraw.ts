@@ -5,7 +5,7 @@ async function main() {
   const to =
     process.env.WITHDRAW_TO ||
     (await (await ethers.getSigners())[0].getAddress())
-  const c = await ethers.getContractAt("VietlotCommitReveal", addr)
+  const c = await ethers.getContractAt("VietlotCommitRevealV3", addr)
   const rid = Number((await c.currentRoundId()).toString())
 
   // finalize

@@ -2,13 +2,14 @@ import { ethers } from "hardhat"
 
 async function main() {
   const addr = process.env.CONTRACT_ADDRESS!
-  const c = await ethers.getContractAt("VietlotCommitReveal", addr)
+  const c = await ethers.getContractAt("VietlotCommitRevealV3", addr)
   const rid = Number((await c.currentRoundId()).toString())
 
   const sales = await c.getSalesAmount(rid)
   const [pool, drawn] = await c.getPrizePool(rid)
   const [fee, drawable, paid] = await c.getOperatorFee(rid)
   const bal = await ethers.provider.getBalance(addr)
+  const round = await c.getRoundInfo(rid)
 
   console.log("roundId        :", rid)
   console.log(
@@ -37,6 +38,7 @@ async function main() {
     "| paid:",
     paid,
   )
+  console.log("roundInfo      :", round)
 }
 main().catch((e) => {
   console.error(e)

@@ -2,7 +2,7 @@ import { ethers } from "hardhat"
 
 async function main() {
   const addr = process.env.CONTRACT_ADDRESS!
-  const c = await ethers.getContractAt("VietlotCommitReveal", addr)
+  const c = await ethers.getContractAt("VietlotCommitRevealV3", addr)
   const rid = Number((await c.currentRoundId()).toString())
   console.log("currentRoundId =", rid)
   try {

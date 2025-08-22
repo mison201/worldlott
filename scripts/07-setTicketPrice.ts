@@ -12,7 +12,7 @@ async function main() {
   const addr = process.env.CONTRACT_ADDRESS!
   if (!addr) throw new Error("Missing CONTRACT_ADDRESS env")
 
-  const c = await ethers.getContractAt("VietlotCommitReveal", addr)
+  const c = await ethers.getContractAt("VietlotCommitRevealV3", addr)
 
   // Đọc tham số hiện tại
   const n: bigint = await c.n()

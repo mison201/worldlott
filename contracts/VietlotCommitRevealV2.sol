@@ -18,11 +18,14 @@ abstract contract ReentrancyGuard {
 /**
  * @title VietlotCommitReveal
  * @notice Lottery kiểu 6/N với commit–reveal chống front-running, quay số bằng Chainlink VRF V2+ Wrapper.
- *         ĐÃ tách prizePoolLocked & operatorFeeAccrued; rút fee chỉ sau finalizeRound().
+ *         Hạch toán: tách prizePoolLocked & operatorFeeAccrued; rút fee chỉ sau finalizeRound().
  *
  * Commit: keccak256(abi.encode(roundId, sortedNumbers[], salt, msg.sender))
  */
-contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
+contract VietlotCommitRevealV2 is
+    VRFV2PlusWrapperConsumerBase,
+    ReentrancyGuard
+{
     // ===== Game config =====
     uint8 public immutable k; // số lượng con số trên vé (vd 6)
     uint8 public n; // miền số tối đa (vd 55)
@@ -48,22 +51,32 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
         bool drawn;
         uint256 requestId;
         uint8[] winningNumbers;
-        // Doanh thu (tích luỹ khi commitBuy)
+        // Doanh thu (tích luỹ khi commitBuy / commitBuyBatch)
         uint256 salesAmount;
         // ===== Hạch toán tách bạch (khóa sau khi draw) =====
         uint256 operatorFeeAccrued; // phí vận hành tính sau draw
-        uint256 prizePoolLocked; // pool thưởng cố định sau draw
+        uint256 prizePoolLocked; // tổng pool thưởng cố định sau draw (trước khi chia theo bậc)
         bool feeWithdrawn; // đã rút phí vận hành chưa
         bool finalized; // đã "chốt vòng" cho phép rút phí
         // Commit–reveal
         mapping(bytes32 => uint256) userCommitQty; // commitHash => qty committed
         mapping(bytes32 => uint256) userRevealQty; // commitHash => qty revealed
         mapping(bytes32 => uint256) revealedCountByCombo; // numbersHash => tổng qty đã reveal
-        mapping(bytes32 => uint256) claimedCountByCombo; // numbersHash => tổng qty đã claim
-        // Winners (đếm động khi claim)
+        mapping(bytes32 => uint256) claimedCountByCombo; // numbersHash => tổng qty đã claim (mọi user)
+        // (Các biến winners* cũ giữ lại nếu cần theo dõi, nhưng KHÔNG dùng để chi trả)
         uint256 winnersK;
         uint256 winnersK_1;
         uint256 winnersK_2;
+        // --- Phân phối an toàn theo cơ chế "pool còn lại / winners còn lại" ---
+        uint256 tierPoolRemainingK;
+        uint256 tierPoolRemainingK_1;
+        uint256 tierPoolRemainingK_2;
+        uint256 winnersRemainingK;
+        uint256 winnersRemainingK_1;
+        uint256 winnersRemainingK_2;
+        mapping(bytes32 => bool) comboCounted; // numbersHash => đã cộng totalRevealed vào winnersRemaining chưa
+        // --- Ràng buộc claim theo commit của CHÍNH user ---
+        mapping(bytes32 => uint256) userClaimedByCommit; // commitHash => qty đã claim bởi chủ commit
     }
 
     mapping(uint256 => Round) private _rounds;
@@ -88,6 +101,13 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
         uint256 qty,
         uint256 paid
     );
+    event BatchCommitted(
+        uint256 indexed roundId,
+        address indexed user,
+        bytes32[] commitHashes,
+        uint256[] quantities,
+        uint256 totalPaid
+    );
     event Revealed(
         uint256 indexed id,
         address indexed user,
@@ -106,13 +126,6 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
     );
     event Finalized(uint256 indexed id);
     event OperatorFeeWithdrawn(uint256 indexed id, address to, uint256 amount);
-    event BatchCommitted(
-        uint256 indexed roundId,
-        address indexed user,
-        bytes32[] commitHashes,
-        uint256[] quantities,
-        uint256 totalPaid
-    );
 
     constructor(
         address vrfWrapper,
@@ -209,6 +222,11 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
         emit Committed(R.id, msg.sender, commitHash, qty, cost);
     }
 
+    /**
+     * @notice Commit mua nhiều vé cùng lúc để tiết kiệm gas (batch)
+     * @param commitHashes mảng các commitHash (mỗi bộ số nên có salt riêng)
+     * @param quantities   mảng số lượng vé tương ứng
+     */
     function commitBuyBatch(
         bytes32[] calldata commitHashes,
         uint256[] calldata quantities
@@ -228,7 +246,7 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
         uint256 totalCost = 0;
         uint256 totalQty = 0;
 
-        // Pass 1: validate & sum
+        // Pass 1: validate & sum để tránh ghi state khi thất bại
         for (uint256 i = 0; i < len; i++) {
             uint256 qty = quantities[i];
             require(qty > 0 && qty <= 50, "BAD_QTY");
@@ -242,13 +260,9 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
         for (uint256 i = 0; i < len; i++) {
             uint256 qty = quantities[i];
             bytes32 h = commitHashes[i];
-
             R.userCommitQty[h] += qty;
-
-            // Event chi tiết từng commit
             emit Committed(R.id, msg.sender, h, qty, price * qty);
         }
-
         R.salesAmount += totalCost;
 
         // Event gộp cho toàn batch
@@ -340,27 +354,52 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
         R.operatorFeeAccrued = opFee;
         R.prizePoolLocked = R.salesAmount - opFee;
 
+        // Khởi tạo pool còn lại theo từng bậc để chi trả an toàn
+        R.tierPoolRemainingK = (R.prizePoolLocked * prizeBpsK) / 10000;
+        R.tierPoolRemainingK_1 = (R.prizePoolLocked * prizeBpsK_1) / 10000;
+        R.tierPoolRemainingK_2 = (R.prizePoolLocked * prizeBpsK_2) / 10000;
+
         emit Drawn(R.id, win);
     }
 
     // ===== Claim =====
+    /**
+     * @notice Claim thưởng CHỈ bởi chủ commit. Bắt buộc kèm salt để tái tạo commitHash của msg.sender.
+     *         Chia thưởng theo cơ chế "poolRemaining / winnersRemaining" đảm bảo không vượt pool.
+     */
     function claim(
         uint256 roundId,
         uint8[] calldata numbers,
+        bytes32 salt,
         uint256 qty
     ) external nonReentrant {
         Round storage R = _rounds[roundId];
         require(R.drawn, "NOT_DRAWN");
         require(qty > 0, "BAD_QTY");
 
+        // Validate & hash combo (trên bản đã sort)
         bytes32 numbersHash = _validateAndHashNumbers(numbers);
+
+        // Ràng buộc claim đúng commit của CHÍNH user
+        bytes32 commitHash = keccak256(
+            abi.encode(roundId, _sortCopy(numbers), salt, msg.sender)
+        );
+        uint256 revealedByThis = R.userRevealQty[commitHash];
+        require(revealedByThis > 0, "NOT_YOUR_REVEAL");
+        require(
+            R.userClaimedByCommit[commitHash] + qty <= revealedByThis,
+            "OVER_CLAIM_COMMIT"
+        );
+
+        // Tổng revealed của combo này (mọi user) & sanity claim theo combo
         uint256 totalRevealed = R.revealedCountByCombo[numbersHash];
         require(totalRevealed > 0, "NOT_REVEALED");
-        uint256 claimed = R.claimedCountByCombo[numbersHash];
-        require(claimed + qty <= totalRevealed, "OVER_CLAIM");
+        uint256 claimedCombo = R.claimedCountByCombo[numbersHash];
+        require(claimedCombo + qty <= totalRevealed, "OVER_CLAIM");
 
-        // tính bậc trúng
-        uint8 matches = _countMatches(numbers, R.winningNumbers);
+        // Đếm bậc trúng TRÊN BẢN SORTED
+        uint8[] memory sortedNums = _sortCopy(numbers);
+        uint8 matches = _countMatchesSorted(sortedNums, R.winningNumbers);
         uint16 prizeShareBps = (matches == k)
             ? prizeBpsK
             : (matches == k - 1)
@@ -370,30 +409,63 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
                     : 0;
         require(prizeShareBps > 0, "NO_PRIZE");
 
-        // pool thưởng đã khóa sau draw
-        uint256 prizePool = R.prizePoolLocked;
+        // Lần đầu combo này claim → cộng totalRevealed vào winnersRemaining của bậc tương ứng
+        if (!R.comboCounted[numbersHash]) {
+            R.comboCounted[numbersHash] = true;
+            if (matches == k) {
+                R.winnersRemainingK += totalRevealed;
+            } else if (matches == k - 1) {
+                R.winnersRemainingK_1 += totalRevealed;
+            } else {
+                R.winnersRemainingK_2 += totalRevealed;
+            }
+        }
 
-        // winners count (động)
-        if (matches == k) R.winnersK += qty;
-        else if (matches == k - 1) R.winnersK_1 += qty;
-        else if (matches == k - 2) R.winnersK_2 += qty;
+        // Lấy poolRemaining & winnersRemaining theo bậc
+        uint256 poolRemaining;
+        uint256 winnersRemaining;
+        if (matches == k) {
+            poolRemaining = R.tierPoolRemainingK;
+            winnersRemaining = R.winnersRemainingK;
+        } else if (matches == k - 1) {
+            poolRemaining = R.tierPoolRemainingK_1;
+            winnersRemaining = R.winnersRemainingK_1;
+        } else {
+            poolRemaining = R.tierPoolRemainingK_2;
+            winnersRemaining = R.winnersRemainingK_2;
+        }
+        require(winnersRemaining > 0, "NO_WINNERS");
 
-        uint256 winners = (matches == k)
-            ? R.winnersK
-            : (matches == k - 1)
-                ? R.winnersK_1
-                : R.winnersK_2;
-        uint256 tierPool = (prizePool * prizeShareBps) / 10000;
-        uint256 amountPerTicket = (winners > 0) ? (tierPool / winners) : 0;
+        // Tính payout an toàn (integer division)
+        uint256 amountPerTicket = poolRemaining / winnersRemaining;
         uint256 payout = amountPerTicket * qty;
         require(payout > 0, "ZERO_PAYOUT");
 
-        R.claimedCountByCombo[numbersHash] = claimed + qty;
+        // Ghi nhận claim
+        R.claimedCountByCombo[numbersHash] = claimedCombo + qty;
+        R.userClaimedByCommit[commitHash] += qty;
 
+        // Trả tiền
         (bool ok, ) = msg.sender.call{value: payout}("");
         require(ok, "TRANSFER_FAIL");
 
         emit Claimed(roundId, msg.sender, numbersHash, matches, qty, payout);
+
+        // Cập nhật poolRemaining & winnersRemaining sau chi trả
+        unchecked {
+            poolRemaining -= payout;
+            winnersRemaining -= qty;
+        }
+        if (matches == k) {
+            R.tierPoolRemainingK = poolRemaining;
+            R.winnersRemainingK = winnersRemaining;
+        } else if (matches == k - 1) {
+            R.tierPoolRemainingK_1 = poolRemaining;
+            R.winnersRemainingK_1 = winnersRemaining;
+        } else {
+            R.tierPoolRemainingK_2 = poolRemaining;
+            R.winnersRemainingK_2 = winnersRemaining;
+        }
     }
 
     // ===== Operator fee withdraw (sau khi finalize) =====
@@ -519,19 +591,20 @@ contract VietlotCommitReveal is VRFV2PlusWrapperConsumerBase, ReentrancyGuard {
         }
     }
 
-    function _countMatches(
-        uint8[] calldata numbers,
+    // Đếm số trùng trên BẢN ĐÃ SORT
+    function _countMatchesSorted(
+        uint8[] memory numbersSorted,
         uint8[] storage win
     ) internal view returns (uint8 cnt) {
-        uint8[] memory w = win;
+        uint8[] memory w = win; // copy storage -> memory
         uint256 i = 0;
         uint256 j = 0;
-        while (i < numbers.length && j < w.length) {
-            if (numbers[i] == w[j]) {
+        while (i < numbersSorted.length && j < w.length) {
+            if (numbersSorted[i] == w[j]) {
                 cnt++;
                 i++;
                 j++;
-            } else if (numbers[i] < w[j]) {
+            } else if (numbersSorted[i] < w[j]) {
                 i++;
             } else {
                 j++;

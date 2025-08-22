@@ -16,6 +16,7 @@ async function main() {
   // thời gian (giây)
   const salesSecs = Number(process.env.SALES_SECONDS || 3600) // mặc định 60'
   const revealSecs = Number(process.env.REVEAL_SECONDS || 3600) // mặc định 60'
+  const claimSecs = Number(process.env.CLAIM_SECONDS || 0) // 0 = không dùng claim deadline
 
   let cAddress: string
   let c = null as any
@@ -23,8 +24,8 @@ async function main() {
   if (!contractAddr) {
     // Deploy mới
     if (!vrfWrapper) throw new Error("Missing VRF_WRAPPER for deploy")
-    console.log("=> Deploying VietlotCommitReveal ...")
-    const Factory = await ethers.getContractFactory("VietlotCommitReveal")
+    console.log("=> Deploying VietlotCommitRevealV3 ...")
+    const Factory = await ethers.getContractFactory("VietlotCommitRevealV3")
     const contract = await Factory.deploy(
       vrfWrapper,
       k,
@@ -44,7 +45,7 @@ async function main() {
     // Attach vào contract sẵn có
     cAddress = contractAddr
     console.log("=> Attaching to existing contract:", cAddress)
-    c = await ethers.getContractAt("VietlotCommitReveal", cAddress)
+    c = await ethers.getContractAt("VietlotCommitRevealV3", cAddress)
   }
 
   // Open round mới
@@ -52,12 +53,15 @@ async function main() {
   const salesStart = now
   const salesEnd = now + salesSecs
   const revealEnd = salesEnd + revealSecs
+  const claimDeadline = claimSecs > 0 ? revealEnd + claimSecs : 0
 
   console.log(
-    `Opening round: sales [${salesStart} .. ${salesEnd}) | revealEnd ${revealEnd}`,
+    `Opening round: sales [${salesStart} .. ${salesEnd}) | revealEnd ${revealEnd} | claimDeadline ${
+      claimDeadline || "none"
+    }`,
   )
   try {
-    await c.openRound.staticCall(salesStart, salesEnd, revealEnd)
+    await c.openRound.staticCall(salesStart, salesEnd, revealEnd, claimDeadline)
   } catch (e: any) {
     console.error(
       "openRound would revert:",
@@ -65,7 +69,7 @@ async function main() {
     )
     throw e // hoặc return để dừng script
   }
-  const tx = await c.openRound(salesStart, salesEnd, revealEnd)
+  const tx = await c.openRound(salesStart, salesEnd, revealEnd, claimDeadline)
   await tx.wait()
 
   const rid = await c.currentRoundId()

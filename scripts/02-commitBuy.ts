@@ -29,7 +29,7 @@ async function main() {
   const salt = normalizeSaltToBytes32()
 
   // --- Attach contract & read on-chain params ---
-  const c = await ethers.getContractAt("VietlotCommitReveal", contractAddr)
+  const c = await ethers.getContractAt("VietlotCommitRevealV3", contractAddr)
 
   // Luôn lấy roundId on-chain để chắc chắn đúng round hiện tại
   const roundId = Number((await c.currentRoundId()).toString())
